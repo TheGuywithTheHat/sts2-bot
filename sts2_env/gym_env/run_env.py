@@ -73,7 +73,9 @@ from sts2_env.gym_env.action_space import (
 )
 from sts2_env.gym_env.observation import OBS_SIZE as COMBAT_OBS_SIZE, encode_observation
 from sts2_env.core.rng import INT_MAX_EXCLUSIVE
+from sts2_env.map.acts import ALL_ACTS
 from sts2_env.run.run_manager import RunManager
+from sts2_env.run.run_state import RunState
 
 @dataclass(frozen=True)
 class _ActionLayout:
@@ -225,6 +227,8 @@ OBS_ASCENSION_SCALE = 20.0
 
 REWARD_WIN = 1.0
 REWARD_DEATH = -1.0
+REWARD_SHAPING_FLOOR = 0.01
+REWARD_SHAPING_ACT = 0.1
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +245,10 @@ class STS2RunEnv(gymnasium.Env):
         Character to play (``"Ironclad"``, ``"Silent"``, etc.).
     ascension_level : int
         Ascension level (0-20).
+    act_count : int
+        Number of acts to complete (1 through the number of configured acts).
+    reward_shaping : bool
+        Add small rewards for progressing through floors and completing acts.
     max_steps : int
         Maximum environment steps before the episode is truncated.
     max_combat_turns : int
@@ -259,8 +267,12 @@ class STS2RunEnv(gymnasium.Env):
         max_steps: int = DEFAULT_MAX_STEPS,
         max_combat_turns: int = DEFAULT_MAX_COMBAT_TURNS,
         render_mode: str | None = None,
+        act_count: int = len(ALL_ACTS),
+        reward_shaping: bool = False,
     ):
         super().__init__()
+        if not 1 <= act_count <= len(ALL_ACTS):
+            raise ValueError(f"act_count must be between 1 and {len(ALL_ACTS)}")
 
         self.observation_space = spaces.Box(
             low=OBS_VALUE_LOW,
@@ -275,6 +287,8 @@ class STS2RunEnv(gymnasium.Env):
         self.max_steps = max_steps
         self.max_combat_turns = max_combat_turns
         self.render_mode = render_mode
+        self.act_count = act_count
+        self.reward_shaping = reward_shaping
 
         # Mutable state -- set during reset()
         self._mgr: RunManager | None = None
@@ -310,6 +324,8 @@ class STS2RunEnv(gymnasium.Env):
         self._step_count += 1
 
         reward = 0.0
+        previous_floor = self._mgr.run_state.total_floor
+        previous_act = self._mgr.run_state.current_act_index
         phase = self._mgr.phase
         actions = self._mgr.get_available_actions()
 
@@ -340,6 +356,12 @@ class STS2RunEnv(gymnasium.Env):
             if not self._mgr.is_over:
                 self._mgr.run_state.lose_run()
 
+        run_state = self._mgr.run_state
+        floors_completed = max(0, run_state.total_floor - previous_floor)
+        acts_completed = max(0, run_state.current_act_index - previous_act)
+        if acts_completed and run_state.current_act_index >= self.act_count and not self._mgr.is_over:
+            run_state.win_run()
+
         # ---- terminal conditions ----
         terminated = self._mgr.is_over
         truncated = False
@@ -351,6 +373,11 @@ class STS2RunEnv(gymnasium.Env):
             reward = REWARD_WIN if self._mgr.player_won else REWARD_DEATH
         elif truncated:
             reward = REWARD_DEATH
+        if self.reward_shaping:
+            reward += (
+                floors_completed * REWARD_SHAPING_FLOOR
+                + acts_completed * REWARD_SHAPING_ACT
+            )
 
         obs = self._encode_obs()
         info = self._build_info()
@@ -461,6 +488,11 @@ class STS2RunEnv(gymnasium.Env):
             mask[0] = 1
 
         return mask
+
+    @property
+    def run_state(self) -> RunState | None:
+        """Return the current run state, if the environment has been reset."""
+        return self._mgr.run_state if self._mgr is not None else None
 
     # ------------------------------------------------------------------
     # Action dispatch helpers

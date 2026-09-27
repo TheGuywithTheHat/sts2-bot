@@ -69,6 +69,47 @@ def seeded_env(env):
     return env
 
 
+@pytest.mark.parametrize("act_count", [0, 4])
+def test_act_count_must_be_within_configured_acts(act_count):
+    with pytest.raises(ValueError, match="act_count"):
+        STS2RunEnv(act_count=act_count)
+
+
+def test_act_count_stops_after_requested_act(monkeypatch):
+    env = STS2RunEnv(act_count=1)
+    env.reset(seed=42)
+    env._mgr._phase = RunManager.PHASE_BOSS_RELIC
+
+    def advance_to_next_act(action):
+        env._mgr.run_state.current_act_index = 1
+
+    monkeypatch.setattr(env, "_step_boss_relic", advance_to_next_act)
+
+    _, reward, terminated, truncated, _ = env.step(_BOSS_RELIC_START)
+
+    assert terminated
+    assert not truncated
+    assert reward == 1.0
+
+
+def test_reward_shaping_adds_floor_and_act_progress(monkeypatch):
+    env = STS2RunEnv(act_count=3, reward_shaping=True)
+    env.reset(seed=42)
+    env._mgr._phase = RunManager.PHASE_BOSS_RELIC
+
+    def advance_to_next_act(action):
+        env._mgr.run_state.current_act_index = 1
+        env._mgr.run_state.total_floor += 1
+
+    monkeypatch.setattr(env, "_step_boss_relic", advance_to_next_act)
+
+    _, reward, terminated, truncated, _ = env.step(_BOSS_RELIC_START)
+
+    assert not terminated
+    assert not truncated
+    assert reward == pytest.approx(0.11)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

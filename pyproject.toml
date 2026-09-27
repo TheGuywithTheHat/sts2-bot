@@ -12,6 +12,8 @@ dependencies = [
 train = [
     "stable-baselines3>=2.3.0",
     "sb3-contrib>=2.3.0",
+    "rich>=13.0.0",
+    "tensorboard>=2.14.0",
     "torch>=2.0",
 ]
 dev = [

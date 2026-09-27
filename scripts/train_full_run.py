@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 
-def make_env(seed: int = 0, act_count: int = 1, reward_shaping: bool = True):
+def make_env(seed: int = 0, act_count: int = 3, reward_shaping: bool = True):
     """Create a single STS2RunEnv wrapped with ActionMasker."""
     from sts2_env.gym_env.run_env import STS2RunEnv
 
@@ -33,10 +33,11 @@ def make_env(seed: int = 0, act_count: int = 1, reward_shaping: bool = True):
     return _init
 
 
-def make_masked_env(seed: int, act_count: int = 1, reward_shaping: bool = True):
+def make_masked_env(seed: int, act_count: int = 3, reward_shaping: bool = True):
     """Create a masked env factory for vectorised envs."""
     try:
         from sb3_contrib.common.wrappers import ActionMasker
+        from stable_baselines3.common.monitor import Monitor
     except ImportError:
         print("Training requires sb3-contrib and stable-baselines3.")
         print("Install with: pip install 'sts2-rl-agent[train]'")
@@ -45,7 +46,7 @@ def make_masked_env(seed: int, act_count: int = 1, reward_shaping: bool = True):
     from sts2_env.gym_env.run_env import STS2RunEnv
 
     def mask_fn(env):
-        return env.action_masks()
+        return env.unwrapped.action_masks()
 
     def _init():
         env = STS2RunEnv(
@@ -53,6 +54,7 @@ def make_masked_env(seed: int, act_count: int = 1, reward_shaping: bool = True):
             reward_shaping=reward_shaping,
             max_steps=2000,
         )
+        env = Monitor(env)
         env = ActionMasker(env, mask_fn)
         return env
 
@@ -62,9 +64,8 @@ def make_masked_env(seed: int, act_count: int = 1, reward_shaping: bool = True):
 def train(args):
     try:
         from sb3_contrib import MaskablePPO
-        from sb3_contrib.common.wrappers import ActionMasker
         from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
-        from stable_baselines3.common.callbacks import EvalCallback
+        from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
     except ImportError:
         print("Training requires sb3-contrib and stable-baselines3.")
         print("Install with: pip install 'sts2-rl-agent[train]'")
@@ -94,8 +95,9 @@ def train(args):
             make_masked_env(0, args.act_count, args.reward_shaping)
         ])
 
-    # Eval env (always single)
-    eval_env = DummyVecEnv([
+    # Keep vector-env types aligned to avoid SB3 evaluation warnings.
+    eval_env_class = SubprocVecEnv if args.n_envs > 1 else DummyVecEnv
+    eval_env = eval_env_class([
         make_masked_env(9999, args.act_count, args.reward_shaping)
     ])
 
@@ -119,7 +121,7 @@ def train(args):
     )
 
     # Eval callback
-    eval_callback = EvalCallback(
+    eval_callback = MaskableEvalCallback(
         eval_env,
         best_model_save_path=str(output_dir / "best_model"),
         log_path=str(output_dir / "eval_logs"),
@@ -146,13 +148,17 @@ def train(args):
 
     # Quick evaluation
     print("\n--- Final Evaluation ---")
-    evaluate(model, act_count=args.act_count, n_episodes=100)
+    evaluate(
+        model,
+        act_count=args.act_count,
+        n_episodes=args.final_eval_episodes,
+    )
 
     train_env.close()
     eval_env.close()
 
 
-def evaluate(model, act_count: int = 1, n_episodes: int = 100):
+def evaluate(model, act_count: int = 3, n_episodes: int = 100):
     """Evaluate a trained model on the full-run environment."""
     from sb3_contrib.common.wrappers import ActionMasker
     from sts2_env.gym_env.run_env import STS2RunEnv
@@ -188,7 +194,7 @@ def evaluate(model, act_count: int = 1, n_episodes: int = 100):
         episode_lengths.append(steps)
         # Access the unwrapped env's run_state for stats
         unwrapped = env.unwrapped if hasattr(env, "unwrapped") else env
-        if hasattr(unwrapped, "run_state") and unwrapped.run_state is not None:
+        if unwrapped.run_state is not None:
             floors_reached.append(unwrapped.run_state.total_floor)
         else:
             floors_reached.append(0)
@@ -201,7 +207,7 @@ def evaluate(model, act_count: int = 1, n_episodes: int = 100):
     print(f"Max floors:       {max(floors_reached)}")
 
 
-def random_baseline(act_count: int = 1, n_episodes: int = 100):
+def random_baseline(act_count: int = 3, n_episodes: int = 100):
     """Run a random-action baseline for comparison."""
     from sts2_env.gym_env.run_env import STS2RunEnv
 
@@ -249,8 +255,8 @@ def main():
         help="Number of parallel environments (default: 4)",
     )
     parser.add_argument(
-        "--act-count", type=int, default=1,
-        help="Number of acts to play per run (1=Act0 only, 3=full game; default: 1)",
+        "--act-count", type=int, default=3,
+        help="Number of acts to play per run (1=first act, 3=full game; default: 3)",
     )
     parser.add_argument(
         "--lr", type=float, default=3e-4,
@@ -293,6 +299,14 @@ def main():
         help="Episodes per evaluation (default: 10)",
     )
     parser.add_argument(
+        "--baseline-episodes", type=int, default=50,
+        help="Random baseline episodes before training; 0 skips it (default: 50)",
+    )
+    parser.add_argument(
+        "--final-eval-episodes", type=int, default=100,
+        help="Episodes in the final evaluation (default: 100)",
+    )
+    parser.add_argument(
         "--output-dir", type=str, default="output/run_ppo",
         help="Output directory (default: output/run_ppo)",
     )
@@ -305,10 +319,13 @@ def main():
     if args.baseline_only:
         random_baseline(act_count=args.act_count)
     else:
-        # Print random baseline first for reference
-        print("Running random baseline for reference...")
-        random_baseline(act_count=args.act_count, n_episodes=50)
-        print()
+        if args.baseline_episodes > 0:
+            print("Running random baseline for reference...")
+            random_baseline(
+                act_count=args.act_count,
+                n_episodes=args.baseline_episodes,
+            )
+            print()
         train(args)
 
 
